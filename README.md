@@ -170,7 +170,11 @@ Sign public key:
 
 ##  WARNING
 
-This code is experimental, incomplete and will definitely void your warranty.
+This code is experimental, incomplete and under active development subject to sudden
+changes. 
 
 https://hacker.house
 
+# License
+
+These files are available under the 3-clause BSD license.
