@@ -73,6 +73,19 @@ void bcw_set_private_callbacks(bcw_private_cb on_private, bcw_event_cb on_event)
  * Returns 0 if sent or queued. */
 int bcw_send_private(const char *who, const char *text);
 
+/* Same, with a caller-chosen messageID (36-char UUID string, see
+ * bcw_new_message_id). Retries with the same ID are deduped by the app. */
+int bcw_send_private_with_id(const char *who, const char *text, const char *msg_id);
+void bcw_new_message_id(char out[37]);
+
+/* Delivered ACK (or read receipt) for one of our PMs: 0x03 || messageID */
+typedef void (*bcw_delivered_cb)(const uint8_t peer_id[8], const char *msg_id);
+void bcw_set_delivered_cb(bcw_delivered_cb on_delivered);
+
+/* Write a finished packet to every ready link through the bcw_send_fn.
+ * BLE queue only. Returns 0 if at least one link took it. */
+int bcw_broadcast(const uint8_t *pkt, uint16_t len);
+
 /* Resolve a nickname or 16-hex peer ID to a peer ID. Returns 0 on success. */
 int bcw_lookup_peer(const char *who, uint8_t id_out[8]);
 
