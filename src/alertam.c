@@ -5,7 +5,9 @@
 
 #include <string.h>
 #include <zephyr/drivers/gpio.h>
+#include <stdlib.h>
 #include <zephyr/init.h>
+#include <esp_bt.h>
 #include <zephyr/shell/shell.h>
 #include <zephyr/sys/printk.h>
 
@@ -588,6 +590,59 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_sos,
 	SHELL_SUBCMD_SET_END
 );
 SHELL_CMD_REGISTER(sos, &sub_sos, "Alertam alerts", NULL);
+
+/* BLE TX power at runtime (range tests). The ESP controller takes an
+ * esp_power_level_t index: -24..+18 dBm in 3 dB steps, then +20. Boot default
+ * comes from CONFIG_BT_CTLR_TX_PWR_* (+9 dBm); this setting is not saved. */
+static int dbm_to_level(int dbm)
+{
+	if (dbm == 20) {
+		return ESP_PWR_LVL_P20;
+	}
+	if (dbm < -24 || dbm > 18 || (dbm + 24) % 3 != 0) {
+		return -1;
+	}
+	return (dbm + 24) / 3;
+}
+
+static int level_to_dbm(int lvl)
+{
+	return lvl == ESP_PWR_LVL_P20 ? 20 : lvl * 3 - 24;
+}
+
+static int cmd_txpower(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc >= 2) {
+		int lvl = dbm_to_level(atoi(argv[1]));
+
+		if (lvl < 0) {
+			shell_error(sh, "Use -24..18 in steps of 3, or 20 (dBm)");
+			return -EINVAL;
+		}
+		int err = esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, lvl);
+
+		err |= esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, lvl);
+		err |= esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, lvl);
+		/* Live links: handles without a connection just fail, ignore them */
+		for (int h = ESP_BLE_PWR_TYPE_CONN_HDL0; h <= ESP_BLE_PWR_TYPE_CONN_HDL8; h++) {
+			(void)esp_ble_tx_power_set(h, lvl);
+		}
+		if (err) {
+			shell_error(sh, "Controller rejected the setting");
+			return -EIO;
+		}
+	}
+	int d = esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_DEFAULT);
+	int a = esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_ADV);
+	int c = esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_CONN_HDL0);
+
+	shell_print(sh, "TX power: default %+d dBm, adv %+d dBm, link0 %s%d dBm (not saved; reboot = +9)",
+		    level_to_dbm(d), level_to_dbm(a),
+		    c == ESP_PWR_LVL_INVALID ? "n/a " : (c >= 8 ? "+" : ""),
+		    c == ESP_PWR_LVL_INVALID ? 0 : level_to_dbm(c));
+	return 0;
+}
+SHELL_CMD_REGISTER(txpower, NULL, "[dBm] - Show/set BLE TX power (-24..18 step 3, or 20)", cmd_txpower);
 
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_circle,
 	SHELL_CMD(add, NULL, "<nick|peer-id> - Add to the private SOS circle", cmd_circle_add),
