@@ -90,6 +90,8 @@ static int connection_count = 0;
 /* Per-connection GATT parameters to avoid race conditions */
 static struct bt_gatt_subscribe_params subscribe_params[CONFIG_BT_MAX_CONN];
 static struct bt_gatt_discover_params discover_params[CONFIG_BT_MAX_CONN];
+/* Alertam: used by Zephyr to locate the peer's real CCC descriptor */
+static struct bt_gatt_discover_params ccc_disc_params[CONFIG_BT_MAX_CONN];
 static struct bt_gatt_exchange_params mtu_exchange_params[CONFIG_BT_MAX_CONN];
 
 /* Noise sessions (one per connection) */
@@ -2581,13 +2583,17 @@ static uint8_t discover_func(struct bt_conn *conn,
 				subscribe_params[i].subscribe = subscribed_func;  /* Called when CCC write completes */
 				subscribe_params[i].value = BT_GATT_CCC_NOTIFY;
 				subscribe_params[i].value_handle = chrc->value_handle;
-				subscribe_params[i].ccc_handle = chrc->value_handle + 1; /* CCC is typically next handle */
+				/* Alertam: don't assume CCC == value_handle + 1 (wrong on phones,
+				 * gives ATT err 3); let Zephyr discover the real descriptor. */
+				subscribe_params[i].ccc_handle = BT_GATT_AUTO_DISCOVER_CCC_HANDLE;
+				subscribe_params[i].end_handle = params->end_handle;
+				subscribe_params[i].disc_params = &ccc_disc_params[i];
 				
 				if (bt_debug_enabled) {
 					char addr[BT_ADDR_LE_STR_LEN];
 					bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-					printk("[GATT] Subscribing to handle 0x%04x (CCC 0x%04x) for %s\n", 
-					       chrc->value_handle, chrc->value_handle + 1, addr);
+					printk("[GATT] Subscribing to handle 0x%04x (CCC auto-discover) for %s\n",
+					       chrc->value_handle, addr);
 				}
 				
 				int ret = bt_gatt_subscribe(conn, &subscribe_params[i]);
@@ -2596,7 +2602,8 @@ static uint8_t discover_func(struct bt_conn *conn,
 				}
 				/* Note: INIT will be sent by subscribed_func callback after CCC write completes */
 				
-				break;
+				/* Alertam: stop char discovery so CCC discovery can run */
+				return BT_GATT_ITER_STOP;
 			}
 		}
 	}
