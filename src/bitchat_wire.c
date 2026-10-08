@@ -66,13 +66,26 @@ static void platform_random(uint8_t *buf, size_t len)
 
 int bcw_identity_init(struct bitchat_identity *id)
 {
-	uint8_t seed[32];
-	/* Noise static key: raw X25519 (Monocypher) so noise_xx.c can use it */
-	nx_x25519_keypair(id->noise_private, id->noise_public, platform_random);
+	uint8_t noise_priv[32], seed[32];
+	platform_random(noise_priv, sizeof(noise_priv));
 	if (psa_generate_random(seed, sizeof(seed)) != PSA_SUCCESS) {
 		return -1;
 	}
-	crypto_ed25519_key_pair(ed_secret, ed_public, seed); /* wipes seed */
+	int ret = bcw_identity_init_from(id, noise_priv, seed);
+	crypto_wipe(noise_priv, sizeof(noise_priv));
+	crypto_wipe(seed, sizeof(seed));
+	return ret;
+}
+
+int bcw_identity_init_from(struct bitchat_identity *id, const uint8_t noise_priv[32],
+			   const uint8_t ed_seed[32])
+{
+	uint8_t seed[32];
+	/* Noise static key: raw X25519 (Monocypher) so noise_xx.c can use it */
+	memcpy(id->noise_private, noise_priv, 32);
+	crypto_x25519_public_key(id->noise_public, id->noise_private);
+	memcpy(seed, ed_seed, sizeof(seed));
+	crypto_ed25519_key_pair(ed_secret, ed_public, seed); /* wipes the copy */
 	memcpy(id->sign_public, ed_public, 32);
 	memcpy(noise_static.priv, id->noise_private, 32);
 	memcpy(noise_static.pub, id->noise_public, 32);

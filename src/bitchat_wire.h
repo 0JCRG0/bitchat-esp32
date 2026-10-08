@@ -32,6 +32,12 @@
  * Copies the Ed25519 public key into id->sign_public. */
 int bcw_identity_init(struct bitchat_identity *id);
 
+/* Same, but from existing private material (persisted identity): rebuilds the
+ * X25519 public key, the Ed25519 keypair from its 32-byte seed and the peer ID.
+ * Fills id->noise_private/noise_public/sign_public. Inputs are not modified. */
+int bcw_identity_init_from(struct bitchat_identity *id, const uint8_t noise_priv[32],
+			   const uint8_t ed_seed[32]);
+
 /* 8-byte peer ID (SHA-256(noise_public)[0..7]) */
 const uint8_t *bcw_peer_id(void);
 
