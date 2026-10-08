@@ -2730,8 +2730,9 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi,
 		return;
 	}
 	
-	/* Only connect to connectable advertisements with reasonable RSSI */
-	if (adv_type != BT_GAP_ADV_TYPE_ADV_IND || rssi < -70) {
+	/* Only connect to connectable advertisements with reasonable RSSI.
+	 * Alertam: -70 was too strict for a phone a couple of metres away. */
+	if (adv_type != BT_GAP_ADV_TYPE_ADV_IND || rssi < -85) {
 		return;
 	}
 	
@@ -2831,6 +2832,18 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi,
 		
 		/* Compare addresses: if peer's address > our address, let them connect to us */
 		int cmp = memcmp(addr->a.val, local_addr.a.val, 6);
+		/* Alertam: phones (BitChat app) often never connect to us, so the
+		 * race rule deadlocked: nobody connected. Wait up to 8 s, then
+		 * connect anyway. */
+		static int64_t waiting_since;
+		int64_t t = k_uptime_get();
+		if (cmp > 0 && waiting_since == 0) {
+			waiting_since = t;
+		}
+		if (cmp > 0 && (t - waiting_since) >= 8000) {
+			waiting_since = 0;
+			cmp = 0;
+		}
 		if (cmp > 0) {
 			if (bt_debug_enabled) {
 				char peer_str[BT_ADDR_LE_STR_LEN];
