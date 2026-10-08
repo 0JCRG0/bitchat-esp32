@@ -2398,14 +2398,14 @@ static int wire_send_raw(const uint8_t *pkt, uint16_t len)
 	return sent > 0 ? 0 : -ENOTCONN;
 }
 
-/* Public message on every ready link (Alertam public alert). ble_workq only. */
-static int wire_public(const char *text)
+/* Links a packet can be written to right now (Alertam alert retries) */
+static int wire_links_ready(void)
 {
-	int sent = 0;
+	int n = 0;
 	for (int i = 0; i < connection_count; i++) {
-		sent += wire_send(i, BCW_TYPE_MESSAGE, text) == 0;
+		n += active_connections[i] && connection_ready[i] && remote_handles[i];
 	}
-	return sent > 0 ? 0 : -ENOTCONN;
+	return n;
 }
 
 static void wire_on_private(const uint8_t id[8], const char *nickname, const char *text)
@@ -2458,6 +2458,7 @@ static void wire_on_clock_sync(void)
 {
 	printk("[Wire] Clock synced from peer: %llu ms\n", bcw_now_ms());
 	k_work_reschedule_for_queue(&ble_workq, &announce_work, K_NO_WAIT);
+	alertam_link_ready(); /* pending alerts can be stamped now */
 }
 
 static void send_message_work_handler(struct k_work *work)
@@ -2517,6 +2518,7 @@ static void send_identity_broadcast_work_handler(struct k_work *work)
 	} else if (wire_send(conn_idx, BCW_TYPE_ANNOUNCE, NULL) == 0 && debug_enabled) {
 		printk("[Identity] Sent signed announce\n");
 	}
+	alertam_link_ready(); /* deliver pending alerts on the new link */
 	
 	/* Release reference taken when submitting work */
 	bt_conn_unref(conn);
@@ -4367,7 +4369,7 @@ int main(void)
 	}
 	printk("[BLE] Bluetooth ready\n");
 	k_work_schedule_for_queue(&ble_workq, &announce_work, K_SECONDS(5));
-	alertam_init(&ble_workq, wire_public);
+	alertam_init(&ble_workq, wire_links_ready);
 	
 	printk("\n=== bitchat ===\n");
 	printk("Joined: %s as %s\n\n", current_channel, local_identity.nickname);
