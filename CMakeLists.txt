@@ -7,6 +7,7 @@ target_sources(app PRIVATE
     src/main.c
     src/bitchat_crypto.c
     src/bitchat_wire.c
+    src/noise_xx.c
     lib/monocypher/monocypher.c
     lib/monocypher/monocypher-ed25519.c
 )

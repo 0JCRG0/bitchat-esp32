@@ -54,6 +54,28 @@ void bcw_set_callbacks(bcw_peer_cb on_peer, bcw_message_cb on_message);
  * Returns true if the packet was an announce / public message and was consumed. */
 bool bcw_handle_rx(const uint8_t *pkt, uint16_t len);
 
+/* ---------- Private messages (Noise XX, see noise_xx.h) ---------- */
+
+#define BCW_TYPE_NOISE_HANDSHAKE 0x10
+#define BCW_TYPE_NOISE_ENCRYPTED 0x11
+
+/* Writes a finished packet to the link(s). Called from the BLE work queue. */
+typedef int (*bcw_send_fn)(const uint8_t *pkt, uint16_t len);
+void bcw_set_send(bcw_send_fn send);
+
+typedef void (*bcw_private_cb)(const uint8_t peer_id[8], const char *nickname,
+			       const char *text);
+typedef void (*bcw_event_cb)(const char *fmt_msg);
+void bcw_set_private_callbacks(bcw_private_cb on_private, bcw_event_cb on_event);
+
+/* Send a private message to a known peer (by nickname or 16-hex peer ID).
+ * Starts a handshake first if there is no session. Must run on the BLE queue.
+ * Returns 0 if sent or queued. */
+int bcw_send_private(const char *who, const char *text);
+
+/* Number of established Noise sessions */
+int bcw_session_count(void);
+
 /* Callback fired once, the first time the clock gets synced */
 void bcw_set_clock_sync_cb(void (*cb)(void));
 

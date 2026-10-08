@@ -2382,6 +2382,53 @@ static void wire_on_message(const uint8_t id[8], const char *nickname,
 	printk("<%s> %s%s\n", nickname, text, verified ? "" : "  [unverified]");
 }
 
+/* Send a finished packet (Noise 0x10/0x11) to every ready link */
+static int wire_send_raw(const uint8_t *pkt, uint16_t len)
+{
+	int sent = 0;
+	for (int i = 0; i < connection_count; i++) {
+		if (active_connections[i] && connection_ready[i] && remote_handles[i] &&
+		    len <= connection_mtu[i] - 3 &&
+		    bt_gatt_write_without_response(active_connections[i], remote_handles[i],
+						   pkt, len, false) == 0) {
+			sent++;
+		}
+	}
+	return sent > 0 ? 0 : -ENOTCONN;
+}
+
+static void wire_on_private(const uint8_t id[8], const char *nickname, const char *text)
+{
+	char from[bitchat_NICKNAME_LEN + 8];
+	snprintk(from, sizeof(from), "PM %s", nickname);
+	store_message(from, text);
+	printk("[PM] <%s> %s\n", nickname, text);
+}
+
+static void wire_on_event(const char *msg)
+{
+	printk("%s\n", msg);
+}
+
+/* `pm` runs on the shell thread; Noise + GATT writes must run on ble_workq */
+static struct {
+	struct k_work work;
+	char who[24];
+	char text[256];
+} pm_work;
+
+static void pm_work_handler(struct k_work *work)
+{
+	int ret = bcw_send_private(pm_work.who, pm_work.text);
+	if (ret == -ENOENT) {
+		printk("[PM] Unknown peer '%s' (see 'list')\n", pm_work.who);
+	} else if (ret < 0) {
+		printk("[PM] Send failed (%d)\n", ret);
+	} else {
+		printk("[PM] -> %s: %s\n", pm_work.who, pm_work.text);
+	}
+}
+
 static void announce_work_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(announce_work, announce_work_handler);
 
@@ -3785,6 +3832,31 @@ static int cmd_send(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static int cmd_pm(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc < 3) {
+		shell_print(sh, "Usage: pm <nickname|peer-id> <message>");
+		return -EINVAL;
+	}
+	if (k_work_busy_get(&pm_work.work)) {
+		shell_error(sh, "[PM] Previous message still sending");
+		return -EBUSY;
+	}
+	strncpy(pm_work.who, argv[1], sizeof(pm_work.who) - 1);
+	pm_work.who[sizeof(pm_work.who) - 1] = '\0';
+	size_t pos = 0;
+	for (size_t a = 2; a < argc && pos < sizeof(pm_work.text) - 1; a++) {
+		int w = snprintk(pm_work.text + pos, sizeof(pm_work.text) - pos, "%s%s",
+				 a > 2 ? " " : "", argv[a]);
+		if (w < 0) {
+			break;
+		}
+		pos = MIN(pos + (size_t)w, sizeof(pm_work.text) - 1);
+	}
+	k_work_submit_to_queue(&ble_workq, &pm_work.work);
+	return 0;
+}
+
 static int cmd_privacy(const struct shell *sh, size_t argc, char **argv)
 {
 	if (argc < 2) {
@@ -4084,7 +4156,8 @@ SHELL_CMD_REGISTER(gps, NULL, "[lat,lon] - Show/set GPS coordinates", cmd_gps);
 SHELL_CMD_REGISTER(channel, NULL, "<name> - Join/switch channel", cmd_channel);
 SHELL_CMD_REGISTER(join, NULL, "<name> - Alias for channel", cmd_channel);
 SHELL_CMD_REGISTER(privmsg, NULL, "<addr> <msg> - Private message", cmd_privmsg);
-SHELL_CMD_REGISTER(stealth, NULL, "<on|off> - Stealth mode (default: on)", cmd_stealth);
+SHELL_CMD_REGISTER(pm, NULL, "<nick|peer-id> <msg> - Noise-encrypted private message (BitChat app)", cmd_pm);
+SHELL_CMD_REGISTER(stealth, NULL, "<on|off> - Stealth mode (default: off)", cmd_stealth);
 SHELL_CMD_REGISTER(privacy, NULL, "<on|off> - Privacy cover traffic", cmd_privacy);
 SHELL_CMD_REGISTER(cover, NULL, "<on|off> - Alias for privacy", cmd_privacy);
 
@@ -4265,6 +4338,9 @@ int main(void)
 	}
 	bcw_set_callbacks(wire_on_peer, wire_on_message);
 	bcw_set_clock_sync_cb(wire_on_clock_sync);
+	bcw_set_send(wire_send_raw);
+	bcw_set_private_callbacks(wire_on_private, wire_on_event);
+	k_work_init(&pm_work.work, pm_work_handler);
 	printk("[Identity] Ready: %s\n", local_identity.nickname);
 	
 	/* Compute Nostr channel hash for "#bluetooth" */
