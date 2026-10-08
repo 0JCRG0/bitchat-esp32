@@ -10,6 +10,8 @@ target_sources(app PRIVATE
     src/noise_xx.c
     src/gesture.c
     src/alertam.c
+    src/alertam_store.c
+    src/alertam_record.c
     lib/monocypher/monocypher.c
     lib/monocypher/monocypher-ed25519.c
 )
