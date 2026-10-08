@@ -454,10 +454,15 @@ static int cmd_sos_status(const struct shell *sh, size_t argc, char **argv)
 		for (int i = 0; i < priv.n; i++) {
 			const struct ar_rcpt *r = &priv.r[i];
 			bool waiting = r->state == AR_RCPT_PENDING || r->state == AR_RCPT_SENT;
-			shell_print(sh, "  %-12s %s  %s, %u attempt(s), %u failure(s)%s%lld%s",
+			char next[40] = "";
+
+			if (waiting) {
+				snprintk(next, sizeof(next), ", next in %lld s",
+					 (long long)(MAX(0, r->next - now) / 1000));
+			}
+			shell_print(sh, "  %-12s %s  %s, %u attempt(s), %u failure(s)%s",
 				    rcpt[i].name, rcpt[i].id_hex, ar_rcpt_state_name(r->state),
-				    r->attempts, r->failures, waiting ? ", next in " : "",
-				    waiting ? MAX(0, r->next - now) / 1000 : 0LL, waiting ? " s" : "");
+				    r->attempts, r->failures, next);
 		}
 	}
 	k_mutex_unlock(&alert_lock);
