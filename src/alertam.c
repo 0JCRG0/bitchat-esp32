@@ -9,6 +9,7 @@
 #include <zephyr/sys/printk.h>
 
 #include "alert_retry.h"
+#include "alertam_store.h"
 #include "bitchat_wire.h"
 #include "gesture.h"
 
@@ -332,6 +333,41 @@ static void button_thread(void *a, void *b, void *c)
 	}
 }
 
+/* ---------- persistence (alertam_store.c) ---------- */
+
+static void circle_save(const struct shell *sh)
+{
+	struct arec_member m[CIRCLE_MAX];
+	int n = 0;
+	for (int i = 0; i < CIRCLE_MAX; i++) {
+		if (circle[i].used) {
+			memcpy(m[n].name, circle[i].name, sizeof(m[n].name));
+			memcpy(m[n].id_hex, circle[i].id_hex, sizeof(m[n].id_hex));
+			n++;
+		}
+	}
+	if (astore_save_circle(m, n) != 0) {
+		shell_warn(sh, "Circle NOT saved to flash (kept in RAM until reboot)");
+	}
+}
+
+static void persisted_load(void)
+{
+	struct arec_member m[CIRCLE_MAX];
+	int n = astore_load_circle(m, CIRCLE_MAX);
+	for (int i = 0; i < n; i++) {
+		circle[i].used = true;
+		memcpy(circle[i].name, m[i].name, sizeof(circle[i].name));
+		memcpy(circle[i].id_hex, m[i].id_hex, sizeof(circle[i].id_hex));
+	}
+	const char *text = astore_sos();
+	if (text) {
+		strncpy(sos_text, text, sizeof(sos_text) - 1);
+	}
+	printk("[Alertam] Loaded %d circle member(s), SOS text %s\n", n,
+	       text ? "from flash" : "default");
+}
+
 K_THREAD_STACK_DEFINE(button_stack, 1536);
 static struct k_thread button_tid;
 
@@ -340,6 +376,7 @@ int alertam_init(struct k_work_q *q, alertam_links_fn links_fn)
 	ble_q = q;
 	links_ready = links_fn;
 	bcw_set_delivered_cb(on_delivered);
+	persisted_load();
 
 	if (!gpio_is_ready_dt(&btn_ext) || !gpio_is_ready_dt(&btn_boot) || !gpio_is_ready_dt(&led)) {
 		printk("[Alertam] GPIO not ready\n");
@@ -373,6 +410,9 @@ static int cmd_sos_text(const struct shell *sh, size_t argc, char **argv)
 		pos = MIN(pos + (size_t)w, sizeof(sos_text) - 1);
 	}
 	shell_print(sh, "SOS text set: \"%s\"", sos_text);
+	if (astore_save_sos(sos_text) != 0) {
+		shell_warn(sh, "SOS text NOT saved to flash");
+	}
 	return 0;
 }
 
@@ -463,6 +503,7 @@ static int cmd_circle_add(const struct shell *sh, size_t argc, char **argv)
 	strncpy(circle[free_slot].name, argv[1], sizeof(circle[free_slot].name) - 1);
 	memcpy(circle[free_slot].id_hex, hex, sizeof(hex));
 	shell_print(sh, "Added %s (%s) to the circle", argv[1], hex);
+	circle_save(sh);
 	return 0;
 }
 
@@ -473,6 +514,7 @@ static int cmd_circle_del(const struct shell *sh, size_t argc, char **argv)
 				       strcmp(circle[i].id_hex, argv[1]) == 0)) {
 			circle[i].used = false;
 			shell_print(sh, "Removed %s", argv[1]);
+			circle_save(sh);
 			return 0;
 		}
 	}
@@ -489,7 +531,7 @@ static int cmd_circle_list(const struct shell *sh, size_t argc, char **argv)
 			n++;
 		}
 	}
-	shell_print(sh, "%d member(s) (RAM only, lost on reboot)", n);
+	shell_print(sh, "%d member(s) (saved in flash)", n);
 	return 0;
 }
 

@@ -18,6 +18,7 @@
 #include "bitchat_protocol.h"
 #include "bitchat_wire.h"
 #include "alertam.h"
+#include "alertam_store.h"
 
 LOG_MODULE_REGISTER(bitchat, LOG_LEVEL_INF);
 
@@ -47,6 +48,17 @@ extern const struct shell *shell_backend_uart_get_ptr(void);
 
 #define MAX_MESSAGE_LEN 100
 #define COVER_TRAFFIC_INTERVAL_MS 15000  /* Dummy packets for privacy */
+
+/* Own peer ID as 16 hex chars (static buffer) */
+static const char *peer_id_hex(void)
+{
+	static char hex[17];
+	const uint8_t *id = bcw_peer_id();
+	for (int i = 0; i < 8; i++) {
+		snprintk(hex + 2 * i, 3, "%02x", id[i]);
+	}
+	return hex;
+}
 
 /* Generate random alphanumeric nickname */
 static void generate_random_nickname(char *nick, size_t len)
@@ -3358,6 +3370,9 @@ static int cmd_nick(const struct shell *sh, size_t argc, char **argv)
 	local_identity.nickname[bitchat_NICKNAME_LEN - 1] = '\0';
 	
 	shell_print(sh, "[Identity] Nickname changed to: %s", local_identity.nickname);
+	if (astore_save_nick(local_identity.nickname) != 0) {
+		shell_warn(sh, "[Identity] Nickname NOT saved to flash");
+	}
 	return 0;
 }
 
@@ -3366,12 +3381,12 @@ static int cmd_keys_generate(const struct shell *sh, size_t argc, char **argv)
 	shell_print(sh, "[Key] Generating new identity keypairs...");
 	
 	if (bitchat_init_identity(&local_identity, local_identity.nickname) != 0 ||
-	    bcw_identity_init(&local_identity) != 0) {
+	    astore_identity_regenerate(&local_identity) != 0) {
 		shell_print(sh, "[Error] Failed to generate new keys");
 		return -EIO;
 	}
 	
-	shell_print(sh, "[Key] New keys generated successfully");
+	shell_print(sh, "[Key] New keys generated and saved (peer ID %s)", peer_id_hex());
 	shell_print(sh, "[Key] Noise public: %02x%02x...%02x%02x",
 	           local_identity.noise_public[0], local_identity.noise_public[1],
 	           local_identity.noise_public[30], local_identity.noise_public[31]);
@@ -4337,18 +4352,26 @@ int main(void)
 	/* Initialize handshake processing work */
 	k_work_init(&handshake_work_item.work, handshake_process_work_handler);
 	
-	/* Generate ephemeral keypairs on boot (not persisted) */
-	printk("[Init] Generating ephemeral identity keys...\n");
+	/* Identity persisted in flash (alertam_store.c); generated on first boot */
+	astore_init();
 	char random_nick[8];
 	generate_random_nickname(random_nick, sizeof(random_nick));
-	if (bitchat_init_identity(&local_identity, random_nick) != 0) {
+	const char *saved_nick = astore_nick();
+	if (bitchat_init_identity(&local_identity, saved_nick ? saved_nick : random_nick) != 0) {
 		printk("[FATAL] Failed to generate identity\n");
 		return -1;
 	}
-	if (bcw_identity_init(&local_identity) != 0) {
-		printk("[FATAL] Failed to generate Ed25519 identity\n");
+	bool id_created;
+	if (astore_identity_load(&local_identity, &id_created) != 0) {
+		printk("[FATAL] Failed to set up Ed25519 identity\n");
 		return -1;
 	}
+	if (!saved_nick) {
+		astore_save_nick(local_identity.nickname);
+	}
+	printk("[Identity] %s: peer ID %s, nickname %s (%s)\n",
+	       id_created ? "NEW identity generated and saved" : "Loaded from flash",
+	       peer_id_hex(), local_identity.nickname, saved_nick ? "saved" : "new");
 	bcw_set_callbacks(wire_on_peer, wire_on_message);
 	bcw_set_clock_sync_cb(wire_on_clock_sync);
 	bcw_set_send(wire_send_raw);
