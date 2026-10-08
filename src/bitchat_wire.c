@@ -563,26 +563,31 @@ static int hexval(char c)
 	return -1;
 }
 
+int bcw_lookup_peer(const char *who, uint8_t id[ID_SIZE])
+{
+	for (int i = 0; i < MAX_KNOWN_PEERS; i++) {
+		if (known[i].used && strcmp(known[i].nickname, who) == 0) {
+			memcpy(id, known[i].id, ID_SIZE);
+			return 0;
+		}
+	}
+	if (strlen(who) != 16) {
+		return -ENOENT;
+	}
+	for (int i = 0; i < ID_SIZE; i++) {
+		int hi = hexval(who[2 * i]), lo = hexval(who[2 * i + 1]);
+		if (hi < 0 || lo < 0) {
+			return -ENOENT;
+		}
+		id[i] = (uint8_t)(hi << 4 | lo);
+	}
+	return 0;
+}
+
 int bcw_send_private(const char *who, const char *text)
 {
 	uint8_t id[ID_SIZE];
-	bool have = false;
-
-	for (int i = 0; i < MAX_KNOWN_PEERS && !have; i++) {
-		if (known[i].used && strcmp(known[i].nickname, who) == 0) {
-			memcpy(id, known[i].id, ID_SIZE);
-			have = true;
-		}
-	}
-	if (!have && strlen(who) == 16) {
-		have = true;
-		for (int i = 0; i < ID_SIZE && have; i++) {
-			int hi = hexval(who[2 * i]), lo = hexval(who[2 * i + 1]);
-			have = hi >= 0 && lo >= 0;
-			id[i] = (uint8_t)(hi << 4 | lo);
-		}
-	}
-	if (!have) {
+	if (bcw_lookup_peer(who, id) != 0) {
 		return -ENOENT;
 	}
 

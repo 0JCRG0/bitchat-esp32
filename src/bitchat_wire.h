@@ -73,6 +73,9 @@ void bcw_set_private_callbacks(bcw_private_cb on_private, bcw_event_cb on_event)
  * Returns 0 if sent or queued. */
 int bcw_send_private(const char *who, const char *text);
 
+/* Resolve a nickname or 16-hex peer ID to a peer ID. Returns 0 on success. */
+int bcw_lookup_peer(const char *who, uint8_t id_out[8]);
+
 /* Number of established Noise sessions */
 int bcw_session_count(void);
 

@@ -1,0 +1,30 @@
+/*
+ * Alertam buttons on the Seeed XIAO ESP32-C6.
+ *
+ * - alertam_btn: external tactile button between D1 (GPIO1) and GND,
+ *   internal pull-up, active low. This is the "real" panic button.
+ * - boot_btn: the on-board BOOT button (GPIO9, has an external pull-up).
+ *   Same gestures, so the firmware can be tested without wiring anything.
+ *
+ * Both feed the same gesture detector (src/gesture.c).
+ */
+/ {
+	alertam_buttons {
+		compatible = "gpio-keys";
+
+		alertam_btn: alertam_button {
+			gpios = <&gpio0 1 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			label = "Alertam button (D1)";
+		};
+
+		boot_btn: boot_button {
+			gpios = <&gpio0 9 GPIO_ACTIVE_LOW>;
+			label = "BOOT button";
+		};
+	};
+
+	aliases {
+		alertam-button = &alertam_btn;
+		alertam-boot-button = &boot_btn;
+	};
+};

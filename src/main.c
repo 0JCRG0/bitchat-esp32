@@ -17,6 +17,7 @@
 #include <string.h>
 #include "bitchat_protocol.h"
 #include "bitchat_wire.h"
+#include "alertam.h"
 
 LOG_MODULE_REGISTER(bitchat, LOG_LEVEL_INF);
 
@@ -2397,6 +2398,16 @@ static int wire_send_raw(const uint8_t *pkt, uint16_t len)
 	return sent > 0 ? 0 : -ENOTCONN;
 }
 
+/* Public message on every ready link (Alertam public alert). ble_workq only. */
+static int wire_public(const char *text)
+{
+	int sent = 0;
+	for (int i = 0; i < connection_count; i++) {
+		sent += wire_send(i, BCW_TYPE_MESSAGE, text) == 0;
+	}
+	return sent > 0 ? 0 : -ENOTCONN;
+}
+
 static void wire_on_private(const uint8_t id[8], const char *nickname, const char *text)
 {
 	char from[bitchat_NICKNAME_LEN + 8];
@@ -4356,6 +4367,7 @@ int main(void)
 	}
 	printk("[BLE] Bluetooth ready\n");
 	k_work_schedule_for_queue(&ble_workq, &announce_work, K_SECONDS(5));
+	alertam_init(&ble_workq, wire_public);
 	
 	printk("\n=== bitchat ===\n");
 	printk("Joined: %s as %s\n\n", current_channel, local_identity.nickname);
