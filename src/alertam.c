@@ -5,6 +5,7 @@
 
 #include <string.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/init.h>
 #include <zephyr/shell/shell.h>
 #include <zephyr/sys/printk.h>
 
@@ -367,6 +368,29 @@ static void persisted_load(void)
 	printk("[Alertam] Loaded %d circle member(s), SOS text %s\n", n,
 	       text ? "from flash" : "default");
 }
+
+/*
+ * XIAO ESP32-C6 RF switch: GPIO3 enables it, GPIO14 selects the antenna
+ * (low = on-board ceramic). Zephyr's board.c only drives these when
+ * CONFIG_XIAO_ESP32C6_EXT_ANTENNA is set, so with the internal antenna the
+ * switch stayed off and BLE range was ~1 m. Drive it ourselves, before BT.
+ */
+#if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(rf_switch)) && !defined(CONFIG_XIAO_ESP32C6_EXT_ANTENNA)
+static int alertam_rf_switch_init(void)
+{
+	const struct gpio_dt_spec en = GPIO_DT_SPEC_GET(DT_NODELABEL(rf_switch), enable_gpios);
+	const struct gpio_dt_spec sel = GPIO_DT_SPEC_GET(DT_NODELABEL(rf_switch), select_gpios);
+
+	if (gpio_is_ready_dt(&en)) {
+		gpio_pin_configure_dt(&en, GPIO_OUTPUT_ACTIVE);
+	}
+	if (gpio_is_ready_dt(&sel)) {
+		gpio_pin_configure_dt(&sel, GPIO_OUTPUT_INACTIVE);
+	}
+	return 0;
+}
+SYS_INIT(alertam_rf_switch_init, POST_KERNEL, CONFIG_APPLICATION_INIT_PRIORITY);
+#endif
 
 K_THREAD_STACK_DEFINE(button_stack, 1536);
 static struct k_thread button_tid;
