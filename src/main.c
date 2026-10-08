@@ -16,11 +16,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include "bitchat_protocol.h"
+#include "bitchat_wire.h"
+#include "alertam.h"
+#include "alertam_store.h"
 
 LOG_MODULE_REGISTER(bitchat, LOG_LEVEL_INF);
 
 /* Dedicated work queue for BLE operations (separate from system work queue) */
-#define BLE_WORKQ_STACK_SIZE 4096
+#define BLE_WORKQ_STACK_SIZE 8192  /* Alertam: Ed25519 sign/verify runs here */
 #define BLE_WORKQ_PRIORITY 5
 
 static K_THREAD_STACK_DEFINE(ble_workq_stack, BLE_WORKQ_STACK_SIZE);
@@ -45,6 +48,17 @@ extern const struct shell *shell_backend_uart_get_ptr(void);
 
 #define MAX_MESSAGE_LEN 100
 #define COVER_TRAFFIC_INTERVAL_MS 15000  /* Dummy packets for privacy */
+
+/* Own peer ID as 16 hex chars (static buffer) */
+static const char *peer_id_hex(void)
+{
+	static char hex[17];
+	const uint8_t *id = bcw_peer_id();
+	for (int i = 0; i < 8; i++) {
+		snprintk(hex + 2 * i, 3, "%02x", id[i]);
+	}
+	return hex;
+}
 
 /* Generate random alphanumeric nickname */
 static void generate_random_nickname(char *nick, size_t len)
@@ -75,7 +89,7 @@ static const struct bt_data bitchat_ad[] = {
 /* Bot identity and state - NOTE: local_identity and current_channel declared earlier */
 static bool privacy_enabled = false;  /* privacy on */
 static bool encryption_enabled = true;  /* E2EE on by default */
-static bool stealth_mode = true;  /* stealth on (monitor without handshake) */
+static bool stealth_mode = false;  /* Alertam: visible by default (upstream: true) */
 static bool bt_debug_enabled = false;  /* Verbose BT logging */
 static bool debug_enabled = false;  /* Noise XX / BitChat packet analysis */
 static bool bt_ready_flag = false;  /* BLE controller ready */
@@ -90,6 +104,8 @@ static int connection_count = 0;
 /* Per-connection GATT parameters to avoid race conditions */
 static struct bt_gatt_subscribe_params subscribe_params[CONFIG_BT_MAX_CONN];
 static struct bt_gatt_discover_params discover_params[CONFIG_BT_MAX_CONN];
+/* Alertam: used by Zephyr to locate the peer's real CCC descriptor */
+static struct bt_gatt_discover_params ccc_disc_params[CONFIG_BT_MAX_CONN];
 static struct bt_gatt_exchange_params mtu_exchange_params[CONFIG_BT_MAX_CONN];
 
 /* Noise sessions (one per connection) */
@@ -1231,6 +1247,14 @@ static ssize_t on_message_received(struct bt_conn *conn,
 		return len;
 	}
 	
+	/* Alertam: hand writes from phones to the same worker as notifications */
+	if (len <= DEBUG_BUFFER_SIZE && k_work_busy_get(&packet_work_item.work) == 0) {
+		packet_work_item.conn = conn;
+		memcpy(packet_work_item.packet_data, buf, len);
+		packet_work_item.packet_len = len;
+		k_work_submit_to_queue(&ble_workq, &packet_work_item.work);
+	}
+
 	/* Remove padding */
 	uint16_t unpadded_len = bitchat_unpad_packet((const uint8_t *)buf, len);
 	const uint8_t *ptr = (const uint8_t *)buf;
@@ -1781,6 +1805,12 @@ static void packet_process_work_handler(struct k_work *work)
 	}
 	bitchat_cache_message(packet_hash);
 	
+	/* Alertam: announces (0x01) and public messages (0x02) use the current
+	 * BitChat wire format, handled in bitchat_wire.c */
+	if (bcw_handle_rx(pw->packet_data, pw->packet_len)) {
+		return;
+	}
+	
 	/* === HANDLE MESSAGE PACKETS (0x01) === */
 	if (type == bitchat_PKT_MESSAGE && payload_len > 0 && payload_len < MAX_MESSAGE_LEN) {
 		
@@ -2315,6 +2345,134 @@ static void handshake_process_work_handler(struct k_work *work)
 }
 
 /* Work handler to send messages - runs in dedicated BLE work queue (for safe GATT writes) */
+
+/* ========== Alertam: current BitChat wire protocol glue ========== */
+
+static uint8_t wire_buf[BCW_MAX_PACKET];
+
+/* Build and write one announce/public message to connection idx.
+ * Runs on ble_workq (wire_buf is shared). */
+static int wire_send(int idx, uint8_t type, const char *text)
+{
+	struct bt_conn *conn = active_connections[idx];
+	uint16_t handle = remote_handles[idx];
+	if (!conn || !connection_ready[idx] || handle == 0) {
+		return -ENOTCONN;
+	}
+	int n = (type == BCW_TYPE_ANNOUNCE)
+		? bcw_build_announce(&local_identity, wire_buf, sizeof(wire_buf))
+		: bcw_build_public_message(text, wire_buf, sizeof(wire_buf));
+	if (n < 0) {
+		return -EINVAL;
+	}
+	if (n > connection_mtu[idx] - 3) {
+		printk("[Wire] Packet %d B > MTU %u, not sent\n", n, connection_mtu[idx]);
+		return -EMSGSIZE;
+	}
+	return bt_gatt_write_without_response(conn, handle, wire_buf, n, false);
+}
+
+static void wire_on_peer(const uint8_t id[8], const char *nickname,
+			 const uint8_t noise_pub[32], const uint8_t sign_pub[32], bool verified)
+{
+	uint64_t sid;
+	memcpy(&sid, id, 8);
+	bool is_new = get_nickname(sid) == NULL;
+	store_nickname(sid, nickname);
+	add_or_update_peer(sid, nickname, current_channel, NULL, noise_pub, sign_pub, true);
+	if (is_new || debug_enabled) {
+		printk("[Peer] %s (%02x%02x%02x%02x%02x%02x%02x%02x) announce %s\n", nickname,
+		       id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7],
+		       verified ? "verified" : "UNVERIFIED");
+	}
+}
+
+static void wire_on_message(const uint8_t id[8], const char *nickname,
+			    const char *text, bool verified)
+{
+	(void)id;
+	store_message(nickname, text);
+	printk("<%s> %s%s\n", nickname, text, verified ? "" : "  [unverified]");
+}
+
+/* Send a finished packet (Noise 0x10/0x11) to every ready link */
+static int wire_send_raw(const uint8_t *pkt, uint16_t len)
+{
+	int sent = 0;
+	for (int i = 0; i < connection_count; i++) {
+		if (active_connections[i] && connection_ready[i] && remote_handles[i] &&
+		    len <= connection_mtu[i] - 3 &&
+		    bt_gatt_write_without_response(active_connections[i], remote_handles[i],
+						   pkt, len, false) == 0) {
+			sent++;
+		}
+	}
+	return sent > 0 ? 0 : -ENOTCONN;
+}
+
+/* Links a packet can be written to right now (Alertam alert retries) */
+static int wire_links_ready(void)
+{
+	int n = 0;
+	for (int i = 0; i < connection_count; i++) {
+		n += active_connections[i] && connection_ready[i] && remote_handles[i];
+	}
+	return n;
+}
+
+static void wire_on_private(const uint8_t id[8], const char *nickname, const char *text)
+{
+	char from[bitchat_NICKNAME_LEN + 8];
+	snprintk(from, sizeof(from), "PM %s", nickname);
+	store_message(from, text);
+	printk("[PM] <%s> %s\n", nickname, text);
+}
+
+static void wire_on_event(const char *msg)
+{
+	printk("%s\n", msg);
+}
+
+/* `pm` runs on the shell thread; Noise + GATT writes must run on ble_workq */
+static struct {
+	struct k_work work;
+	char who[24];
+	char text[256];
+} pm_work;
+
+static void pm_work_handler(struct k_work *work)
+{
+	int ret = bcw_send_private(pm_work.who, pm_work.text);
+	if (ret == -ENOENT) {
+		printk("[PM] Unknown peer '%s' (see 'list')\n", pm_work.who);
+	} else if (ret < 0) {
+		printk("[PM] Send failed (%d)\n", ret);
+	} else {
+		printk("[PM] -> %s: %s\n", pm_work.who, pm_work.text);
+	}
+}
+
+static void announce_work_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(announce_work, announce_work_handler);
+
+/* Re-announce every 10 s so phones keep us in their peer list */
+static void announce_work_handler(struct k_work *work)
+{
+	if (!stealth_mode && bcw_clock_synced()) {
+		for (int i = 0; i < connection_count; i++) {
+			wire_send(i, BCW_TYPE_ANNOUNCE, NULL);
+		}
+	}
+	k_work_reschedule_for_queue(&ble_workq, &announce_work, K_SECONDS(10));
+}
+
+static void wire_on_clock_sync(void)
+{
+	printk("[Wire] Clock synced from peer: %llu ms\n", bcw_now_ms());
+	k_work_reschedule_for_queue(&ble_workq, &announce_work, K_NO_WAIT);
+	alertam_link_ready(); /* pending alerts can be stamped now */
+}
+
 static void send_message_work_handler(struct k_work *work)
 {
 	struct send_message_work *send_work = CONTAINER_OF(work, struct send_message_work, work);
@@ -2333,44 +2491,11 @@ static void send_message_work_handler(struct k_work *work)
 			}
 		}
 	} else {
-		/* Send plaintext message with TLV encoding */
-		uint8_t tlv_payload[256];
-		uint8_t *tlv_ptr = tlv_payload;
-		
-		/* Add nickname TLV */
-		*tlv_ptr++ = bitchat_TLV_NICKNAME;
-		*tlv_ptr++ = strlen(local_identity.nickname);
-		memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
-		tlv_ptr += strlen(local_identity.nickname);
-		
-		/* Add channel hash TLV for message routing (32-byte SHA256) */
-		/* Note: TLV 0x02 is overloaded - 32 bytes can be static key OR channel hash */
-		/* Context determines meaning: in messages = channel, in announcements = key */
-		*tlv_ptr++ = bitchat_TLV_NOISE_INIT;
-		*tlv_ptr++ = 32;
-		memcpy(tlv_ptr, current_channel_hash, 32);
-		tlv_ptr += 32;
-		
-		/* Add text TLV */
-		*tlv_ptr++ = bitchat_TLV_TEXT;
-		*tlv_ptr++ = send_work->message_len;
-		memcpy(tlv_ptr, send_work->message, send_work->message_len);
-		tlv_ptr += send_work->message_len;
-		
-		uint16_t total_len = tlv_ptr - tlv_payload;
-		
-		/* Create MESSAGE packet with TLV payload */
-		struct bitchat_packet pkt;
-		if (bitchat_create_packet(&pkt, bitchat_PKT_MESSAGE, bitchat_MAX_TTL,
-		                         tlv_payload, total_len) == 0) {
-			/* Set recipient to broadcast (all peers) */
-			pkt.header.flags |= bitchat_FLAG_HAS_RECIPIENT;
-			pkt.recipient_id = bitchat_BROADCAST_ID;
-			
-			if (bitchat_send_packet(conn, send_work->handle, &pkt) == 0) {
-				if (debug_enabled) {
-					printk("[Send] Plaintext message sent\n");
-				}
+		/* Alertam: signed public message (type 0x02, raw UTF-8) */
+		int idx = get_conn_index(conn);
+		if (idx >= 0 && wire_send(idx, BCW_TYPE_MESSAGE, (const char *)send_work->message) == 0) {
+			if (debug_enabled) {
+				printk("[Send] Public message sent\n");
 			}
 		}
 	}
@@ -2397,41 +2522,15 @@ static void send_identity_broadcast_work_handler(struct k_work *work)
 		return;
 	}
 	
-	/* Build TLV payload for identity announcement: NICKNAME + NOISE_PUBLIC_KEY + SIGNING_PUBLIC_KEY
-	 * This matches Android/iOS BitChat Bluetooth mesh identity announcement protocol */
-	uint8_t tlv_payload[256];
-	uint8_t *tlv_ptr = tlv_payload;
-	
-	/* Add nickname */
-	*tlv_ptr++ = bitchat_TLV_NICKNAME;
-	*tlv_ptr++ = strlen(local_identity.nickname);
-	memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
-	tlv_ptr += strlen(local_identity.nickname);
-	
-	/* Add static Noise public key (TLV 0x02, 32 bytes) - for E2EE session establishment */
-	*tlv_ptr++ = bitchat_TLV_NOISE_INIT;  /* Type 0x02 with 32 bytes = static key (not handshake) */
-	*tlv_ptr++ = 32;
-	memcpy(tlv_ptr, local_identity.noise_public, 32);
-	tlv_ptr += 32;
-	
-	/* Add Ed25519 signing public key (TLV 0x03, 32 bytes) - for message verification */
-	*tlv_ptr++ = bitchat_TLV_NOISE_RESP;  /* Type 0x03 with 32 bytes = signing key (not handshake) */
-	*tlv_ptr++ = 32;
-	/* TODO: Use actual Ed25519 signing key when available, for now reuse noise_public */
-	memcpy(tlv_ptr, local_identity.noise_public, 32);
-	tlv_ptr += 32;
-	
-	uint16_t total_len = tlv_ptr - tlv_payload;
-	
-	/* Send as PKT_MESSAGE with identity announcement (Android/iOS BitChat protocol) */
-	int ret = send_handshake_packet(conn, bitchat_PKT_MESSAGE, tlv_payload, total_len);
-	if (ret == 0) {
+	/* Alertam: signed announce in the current wire format */
+	if (!bcw_clock_synced()) {
 		if (debug_enabled) {
-			printk("[Identity] Sent identity announcement (channel: %s)\n", current_channel);
+			printk("[Identity] Waiting for a phone packet to learn the time\n");
 		}
-	} else {
-		printk("[Identity] ERROR: Failed to send identity announcement (ret=%d)\n", ret);
+	} else if (wire_send(conn_idx, BCW_TYPE_ANNOUNCE, NULL) == 0 && debug_enabled) {
+		printk("[Identity] Sent signed announce\n");
 	}
+	alertam_link_ready(); /* deliver pending alerts on the new link */
 	
 	/* Release reference taken when submitting work */
 	bt_conn_unref(conn);
@@ -2581,13 +2680,17 @@ static uint8_t discover_func(struct bt_conn *conn,
 				subscribe_params[i].subscribe = subscribed_func;  /* Called when CCC write completes */
 				subscribe_params[i].value = BT_GATT_CCC_NOTIFY;
 				subscribe_params[i].value_handle = chrc->value_handle;
-				subscribe_params[i].ccc_handle = chrc->value_handle + 1; /* CCC is typically next handle */
+				/* Alertam: don't assume CCC == value_handle + 1 (wrong on phones,
+				 * gives ATT err 3); let Zephyr discover the real descriptor. */
+				subscribe_params[i].ccc_handle = BT_GATT_AUTO_DISCOVER_CCC_HANDLE;
+				subscribe_params[i].end_handle = params->end_handle;
+				subscribe_params[i].disc_params = &ccc_disc_params[i];
 				
 				if (bt_debug_enabled) {
 					char addr[BT_ADDR_LE_STR_LEN];
 					bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-					printk("[GATT] Subscribing to handle 0x%04x (CCC 0x%04x) for %s\n", 
-					       chrc->value_handle, chrc->value_handle + 1, addr);
+					printk("[GATT] Subscribing to handle 0x%04x (CCC auto-discover) for %s\n",
+					       chrc->value_handle, addr);
 				}
 				
 				int ret = bt_gatt_subscribe(conn, &subscribe_params[i]);
@@ -2596,7 +2699,8 @@ static uint8_t discover_func(struct bt_conn *conn,
 				}
 				/* Note: INIT will be sent by subscribed_func callback after CCC write completes */
 				
-				break;
+				/* Alertam: stop char discovery so CCC discovery can run */
+				return BT_GATT_ITER_STOP;
 			}
 		}
 	}
@@ -2626,8 +2730,9 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi,
 		return;
 	}
 	
-	/* Only connect to connectable advertisements with reasonable RSSI */
-	if (adv_type != BT_GAP_ADV_TYPE_ADV_IND || rssi < -70) {
+	/* Only connect to connectable advertisements with reasonable RSSI.
+	 * Alertam: -70 was too strict for a phone a couple of metres away. */
+	if (adv_type != BT_GAP_ADV_TYPE_ADV_IND || rssi < -85) {
 		return;
 	}
 	
@@ -2727,6 +2832,18 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi,
 		
 		/* Compare addresses: if peer's address > our address, let them connect to us */
 		int cmp = memcmp(addr->a.val, local_addr.a.val, 6);
+		/* Alertam: phones (BitChat app) often never connect to us, so the
+		 * race rule deadlocked: nobody connected. Wait up to 8 s, then
+		 * connect anyway. */
+		static int64_t waiting_since;
+		int64_t t = k_uptime_get();
+		if (cmp > 0 && waiting_since == 0) {
+			waiting_since = t;
+		}
+		if (cmp > 0 && (t - waiting_since) >= 8000) {
+			waiting_since = 0;
+			cmp = 0;
+		}
 		if (cmp > 0) {
 			if (bt_debug_enabled) {
 				char peer_str[BT_ADDR_LE_STR_LEN];
@@ -3266,6 +3383,9 @@ static int cmd_nick(const struct shell *sh, size_t argc, char **argv)
 	local_identity.nickname[bitchat_NICKNAME_LEN - 1] = '\0';
 	
 	shell_print(sh, "[Identity] Nickname changed to: %s", local_identity.nickname);
+	if (astore_save_nick(local_identity.nickname) != 0) {
+		shell_warn(sh, "[Identity] Nickname NOT saved to flash");
+	}
 	return 0;
 }
 
@@ -3273,12 +3393,13 @@ static int cmd_keys_generate(const struct shell *sh, size_t argc, char **argv)
 {
 	shell_print(sh, "[Key] Generating new identity keypairs...");
 	
-	if (bitchat_init_identity(&local_identity, local_identity.nickname) != 0) {
+	if (bitchat_init_identity(&local_identity, local_identity.nickname) != 0 ||
+	    astore_identity_regenerate(&local_identity) != 0) {
 		shell_print(sh, "[Error] Failed to generate new keys");
 		return -EIO;
 	}
 	
-	shell_print(sh, "[Key] New keys generated successfully");
+	shell_print(sh, "[Key] New keys generated and saved (peer ID %s)", peer_id_hex());
 	shell_print(sh, "[Key] Noise public: %02x%02x...%02x%02x",
 	           local_identity.noise_public[0], local_identity.noise_public[1],
 	           local_identity.noise_public[30], local_identity.noise_public[31]);
@@ -3653,8 +3774,17 @@ static int cmd_send(const struct shell *sh, size_t argc, char **argv)
 		return -EINVAL;
 	}
 	
-	/* Security: Validate message length early */
-	const char *message = argv[1];
+	/* Alertam: join all words so `send hola a todos` sends the whole line */
+	static char joined[MAX_MESSAGE_LEN + 2];
+	size_t pos = 0;
+	for (size_t a = 1; a < argc && pos < sizeof(joined) - 1; a++) {
+		int w = snprintk(joined + pos, sizeof(joined) - pos, "%s%s", a > 1 ? " " : "", argv[a]);
+		if (w < 0) {
+			break;
+		}
+		pos = MIN(pos + (size_t)w, sizeof(joined) - 1);
+	}
+	const char *message = joined;
 	size_t msg_len = strlen(message);
 	
 	if (msg_len == 0) {
@@ -3740,6 +3870,31 @@ static int cmd_send(const struct shell *sh, size_t argc, char **argv)
 	}
 	shell_print(sh, "  Message: \"%s\"", message);
 	
+	return 0;
+}
+
+static int cmd_pm(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc < 3) {
+		shell_print(sh, "Usage: pm <nickname|peer-id> <message>");
+		return -EINVAL;
+	}
+	if (k_work_busy_get(&pm_work.work)) {
+		shell_error(sh, "[PM] Previous message still sending");
+		return -EBUSY;
+	}
+	strncpy(pm_work.who, argv[1], sizeof(pm_work.who) - 1);
+	pm_work.who[sizeof(pm_work.who) - 1] = '\0';
+	size_t pos = 0;
+	for (size_t a = 2; a < argc && pos < sizeof(pm_work.text) - 1; a++) {
+		int w = snprintk(pm_work.text + pos, sizeof(pm_work.text) - pos, "%s%s",
+				 a > 2 ? " " : "", argv[a]);
+		if (w < 0) {
+			break;
+		}
+		pos = MIN(pos + (size_t)w, sizeof(pm_work.text) - 1);
+	}
+	k_work_submit_to_queue(&ble_workq, &pm_work.work);
 	return 0;
 }
 
@@ -4042,7 +4197,8 @@ SHELL_CMD_REGISTER(gps, NULL, "[lat,lon] - Show/set GPS coordinates", cmd_gps);
 SHELL_CMD_REGISTER(channel, NULL, "<name> - Join/switch channel", cmd_channel);
 SHELL_CMD_REGISTER(join, NULL, "<name> - Alias for channel", cmd_channel);
 SHELL_CMD_REGISTER(privmsg, NULL, "<addr> <msg> - Private message", cmd_privmsg);
-SHELL_CMD_REGISTER(stealth, NULL, "<on|off> - Stealth mode (default: on)", cmd_stealth);
+SHELL_CMD_REGISTER(pm, NULL, "<nick|peer-id> <msg> - Noise-encrypted private message (BitChat app)", cmd_pm);
+SHELL_CMD_REGISTER(stealth, NULL, "<on|off> - Stealth mode (default: off)", cmd_stealth);
 SHELL_CMD_REGISTER(privacy, NULL, "<on|off> - Privacy cover traffic", cmd_privacy);
 SHELL_CMD_REGISTER(cover, NULL, "<on|off> - Alias for privacy", cmd_privacy);
 
@@ -4209,14 +4365,31 @@ int main(void)
 	/* Initialize handshake processing work */
 	k_work_init(&handshake_work_item.work, handshake_process_work_handler);
 	
-	/* Generate ephemeral keypairs on boot (not persisted) */
-	printk("[Init] Generating ephemeral identity keys...\n");
+	/* Identity persisted in flash (alertam_store.c); generated on first boot */
+	astore_init();
 	char random_nick[8];
 	generate_random_nickname(random_nick, sizeof(random_nick));
-	if (bitchat_init_identity(&local_identity, random_nick) != 0) {
+	const char *saved_nick = astore_nick();
+	if (bitchat_init_identity(&local_identity, saved_nick ? saved_nick : random_nick) != 0) {
 		printk("[FATAL] Failed to generate identity\n");
 		return -1;
 	}
+	bool id_created;
+	if (astore_identity_load(&local_identity, &id_created) != 0) {
+		printk("[FATAL] Failed to set up Ed25519 identity\n");
+		return -1;
+	}
+	if (!saved_nick) {
+		astore_save_nick(local_identity.nickname);
+	}
+	printk("[Identity] %s: peer ID %s, nickname %s (%s)\n",
+	       id_created ? "NEW identity generated and saved" : "Loaded from flash",
+	       peer_id_hex(), local_identity.nickname, saved_nick ? "saved" : "new");
+	bcw_set_callbacks(wire_on_peer, wire_on_message);
+	bcw_set_clock_sync_cb(wire_on_clock_sync);
+	bcw_set_send(wire_send_raw);
+	bcw_set_private_callbacks(wire_on_private, wire_on_event);
+	k_work_init(&pm_work.work, pm_work_handler);
 	printk("[Identity] Ready: %s\n", local_identity.nickname);
 	
 	/* Compute Nostr channel hash for "#bluetooth" */
@@ -4231,6 +4404,8 @@ int main(void)
 		return -1;
 	}
 	printk("[BLE] Bluetooth ready\n");
+	k_work_schedule_for_queue(&ble_workq, &announce_work, K_SECONDS(5));
+	alertam_init(&ble_workq, wire_links_ready);
 	
 	printk("\n=== bitchat ===\n");
 	printk("Joined: %s as %s\n\n", current_channel, local_identity.nickname);
