@@ -277,11 +277,13 @@ static struct {
 	struct nx_session nx;
 	int64_t started;
 	char pending[256];   /* one PM waiting for the handshake */
+	char pending_id[37]; /* its messageID ("" = make a new one) */
 } sessions[MAX_SESSIONS];
 
 static bcw_send_fn send_fn;
 static bcw_private_cb private_cb;
 static bcw_event_cb event_cb;
+static bcw_delivered_cb delivered_cb;
 static uint8_t txbuf[BCW_MAX_PACKET];
 
 void bcw_set_send(bcw_send_fn send)
@@ -293,6 +295,16 @@ void bcw_set_private_callbacks(bcw_private_cb on_private, bcw_event_cb on_event)
 {
 	private_cb = on_private;
 	event_cb = on_event;
+}
+
+void bcw_set_delivered_cb(bcw_delivered_cb on_delivered)
+{
+	delivered_cb = on_delivered;
+}
+
+int bcw_broadcast(const uint8_t *pkt, uint16_t len)
+{
+	return send_fn ? send_fn(pkt, len) : -ENOTCONN;
 }
 
 static void event(const char *msg)
@@ -337,14 +349,16 @@ static int session_new(const uint8_t *id, bool initiator)
 			}
 		}
 	}
-	char keep[sizeof(sessions[0].pending)];
-	strcpy(keep, sessions[slot].used && memcmp(sessions[slot].id, id, ID_SIZE) == 0
-		     ? sessions[slot].pending : "");
+	char keep[sizeof(sessions[0].pending)], keep_id[sizeof(sessions[0].pending_id)];
+	bool same = sessions[slot].used && memcmp(sessions[slot].id, id, ID_SIZE) == 0;
+	strcpy(keep, same ? sessions[slot].pending : "");
+	strcpy(keep_id, same ? sessions[slot].pending_id : "");
 	nx_wipe(&sessions[slot].nx);
 	sessions[slot].used = true;
 	memcpy(sessions[slot].id, id, ID_SIZE);
 	sessions[slot].started = k_uptime_get();
 	strcpy(sessions[slot].pending, keep);
+	strcpy(sessions[slot].pending_id, keep_id);
 	/* BitChat uses an empty prologue */
 	nx_init(&sessions[slot].nx, initiator, noise_static.priv, noise_static.pub,
 		NULL, 0, NULL, platform_random);
@@ -380,7 +394,7 @@ static int send_typed(int slot, uint8_t ptype, const uint8_t *body, size_t blen)
 	return send_directed(BCW_TYPE_NOISE_ENCRYPTED, sessions[slot].id, ct, (uint16_t)clen);
 }
 
-static void make_message_id(char out[37])
+void bcw_new_message_id(char out[37])
 {
 	/* UUID v4 string, uppercase like the app's UUID().uuidString */
 	uint8_t r[16];
@@ -399,7 +413,7 @@ static void make_message_id(char out[37])
 	out[o] = '\0';
 }
 
-static int send_pm_now(int slot, const char *text)
+static int send_pm_now(int slot, const char *text, const char *msg_id)
 {
 	char mid[37];
 	uint8_t body[2 + 36 + 2 + 255];
@@ -407,7 +421,11 @@ static int send_pm_now(int slot, const char *text)
 	if (tlen > 255) {
 		tlen = 255;
 	}
-	make_message_id(mid);
+	if (msg_id && strlen(msg_id) == 36) {
+		memcpy(mid, msg_id, 37); /* retry: same ID so the app dedups it */
+	} else {
+		bcw_new_message_id(mid);
+	}
 	size_t o = 0;
 	body[o++] = PM_TLV_MESSAGE_ID;
 	body[o++] = 36;
@@ -444,8 +462,9 @@ static void session_established(int slot)
 	}
 	event("[PM] Noise session established (end-to-end encrypted)");
 	if (sessions[slot].pending[0]) {
-		send_pm_now(slot, sessions[slot].pending);
+		send_pm_now(slot, sessions[slot].pending, sessions[slot].pending_id);
 		sessions[slot].pending[0] = '\0';
+		sessions[slot].pending_id[0] = '\0';
 	}
 }
 
@@ -538,10 +557,15 @@ static void handle_encrypted(const uint8_t *sender, const uint8_t *ct, uint16_t 
 		}
 		/* Delivery ACK: 0x03 || messageID (raw UTF-8) */
 		send_typed(slot, PM_TYPE_DELIVERED, mid, mid_len);
-	} else if (ptype == PM_TYPE_DELIVERED) {
-		event("[PM] Delivered");
-	} else if (ptype == PM_TYPE_READ_RECEIPT) {
-		event("[PM] Read");
+	} else if (ptype == PM_TYPE_DELIVERED || ptype == PM_TYPE_READ_RECEIPT) {
+		/* Body: messageID as raw UTF-8. A read receipt implies delivery. */
+		event(ptype == PM_TYPE_DELIVERED ? "[PM] Delivered" : "[PM] Read");
+		if (delivered_cb && blen > 0 && blen < 64) {
+			char mid[64];
+			memcpy(mid, body, blen);
+			mid[blen] = '\0';
+			delivered_cb(sender, mid);
+		}
 	}
 	/* 0x21 authenticatedPeerState and others: ignored */
 }
@@ -584,7 +608,16 @@ int bcw_lookup_peer(const char *who, uint8_t id[ID_SIZE])
 	return 0;
 }
 
-int bcw_send_private(const char *who, const char *text)
+static void set_pending(int slot, const char *text, const char *msg_id)
+{
+	strncpy(sessions[slot].pending, text, sizeof(sessions[slot].pending) - 1);
+	sessions[slot].pending[sizeof(sessions[slot].pending) - 1] = '\0';
+	strncpy(sessions[slot].pending_id, msg_id ? msg_id : "",
+		sizeof(sessions[slot].pending_id) - 1);
+	sessions[slot].pending_id[sizeof(sessions[slot].pending_id) - 1] = '\0';
+}
+
+int bcw_send_private_with_id(const char *who, const char *text, const char *msg_id)
 {
 	uint8_t id[ID_SIZE];
 	if (bcw_lookup_peer(who, id) != 0) {
@@ -593,16 +626,27 @@ int bcw_send_private(const char *who, const char *text)
 
 	int slot = session_find(id);
 	if (slot >= 0 && nx_handshake_done(&sessions[slot].nx)) {
-		return send_pm_now(slot, text);
+		return send_pm_now(slot, text, msg_id);
 	}
 	if (slot >= 0 && k_uptime_get() - sessions[slot].started < HANDSHAKE_TIMEOUT_MS) {
-		strncpy(sessions[slot].pending, text, sizeof(sessions[slot].pending) - 1);
+		set_pending(slot, text, msg_id);
 		return 0; /* handshake already in flight */
 	}
 	slot = session_new(id, true);
-	strncpy(sessions[slot].pending, text, sizeof(sessions[slot].pending) - 1);
-	sessions[slot].pending[sizeof(sessions[slot].pending) - 1] = '\0';
-	return start_handshake(slot);
+	set_pending(slot, text, msg_id);
+	int ret = start_handshake(slot);
+	if (ret < 0) {
+		/* msg 1 never left: don't let a dead handshake hold the slot (and
+		 * swallow the next attempts) for HANDSHAKE_TIMEOUT_MS */
+		nx_wipe(&sessions[slot].nx);
+		sessions[slot].used = false;
+	}
+	return ret;
+}
+
+int bcw_send_private(const char *who, const char *text)
+{
+	return bcw_send_private_with_id(who, text, NULL);
 }
 
 static bool verify(uint8_t type, uint64_t ts, const uint8_t *sender, const uint8_t *recipient,

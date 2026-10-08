@@ -9,6 +9,7 @@ target_sources(app PRIVATE
     src/bitchat_wire.c
     src/noise_xx.c
     src/gesture.c
+    src/alert_retry.c
     src/alertam.c
     lib/monocypher/monocypher.c
     lib/monocypher/monocypher-ed25519.c

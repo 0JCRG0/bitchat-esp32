@@ -8,6 +8,7 @@
 #include <zephyr/shell/shell.h>
 #include <zephyr/sys/printk.h>
 
+#include "alert_retry.h"
 #include "bitchat_wire.h"
 #include "gesture.h"
 
@@ -19,7 +20,7 @@ static const struct gpio_dt_spec btn_boot = GPIO_DT_SPEC_GET(DT_ALIAS(alertam_bo
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 
 static struct k_work_q *ble_q;
-static alertam_public_fn send_public;
+static alertam_links_fn links_ready;
 
 static char sos_text[200] = "SOS - Alertam: necesito ayuda";
 
@@ -29,34 +30,242 @@ static struct {
 	char id_hex[17];
 } circle[CIRCLE_MAX];
 
-/* ---------- alerts (run on the BLE work queue) ---------- */
+/* ---------- alerts (run on the BLE work queue) ----------
+ *
+ * Nothing is fire-and-forget: both alerts stay active and are retried by
+ * retry_work (1 s tick while anything is active) until delivered, see
+ * alert_retry.h for the rules. State is shared with the shell ('sos status',
+ * 'sos cancel'), hence alert_lock. */
+
+#define RETRY_TICK_MS 1000
+
+BUILD_ASSERT(CIRCLE_MAX <= AR_MAX_RCPT, "one SOS recipient slot per circle member");
+
+static K_MUTEX_DEFINE(alert_lock);
+static atomic_t link_kick; /* a link became usable since the last tick */
+
+static struct ar_public pub;
+static char pub_text[sizeof(sos_text)];  /* text the cached packet carries */
+static uint8_t pub_pkt[BCW_MAX_PACKET];
+static int pub_len;
+
+static struct ar_private priv;
+static char priv_text[sizeof(sos_text)];
+static struct {
+	char name[24];
+	char id_hex[17];
+	uint8_t id[8];
+	char msg_id[37]; /* one per SOS: retries are deduped by the app */
+} rcpt[AR_MAX_RCPT];
+
+static void retry_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(retry_work, retry_handler);
+
+static bool can_send(void)
+{
+	return bcw_clock_synced() && links_ready && links_ready() > 0;
+}
+
+static const char *why_not(void)
+{
+	return !bcw_clock_synced() ? "no phone seen yet (clock not synced)" : "no phone in range";
+}
+
+static void led_confirm(void);
+
+static void public_step(int64_t now, bool ok_to_send, bool new_link)
+{
+	enum ar_pub_state before = pub.state;
+	enum ar_action a = ar_pub_poll(&pub, now, ok_to_send, new_link);
+
+	if (before == AR_PUB_SENT && pub.state == AR_PUB_IDLE) {
+		printk("[Alertam] PUBLIC alert finished (%u writes, %u packets, %d min active)\n",
+		       pub.writes, pub.builds, AR_LIFETIME_MS / 60000);
+		return;
+	}
+	if (a == AR_NONE) {
+		return;
+	}
+	if (a == AR_REBUILD_SEND) {
+		int n = bcw_build_public_message(pub_text, pub_pkt, sizeof(pub_pkt));
+		if (n < 0) {
+			printk("[Alertam] PUBLIC alert: cannot build packet (%d), dropped\n", n);
+			ar_pub_stop(&pub);
+			return;
+		}
+		pub_len = n;
+		if (pub.builds > 0) {
+			printk("[Alertam] PUBLIC alert re-signed (%s)\n", pub.state == AR_PUB_PENDING
+			       ? "cached packet about to go stale" : "phone came into range");
+		}
+		ar_pub_built(&pub, now);
+	}
+	int ret = bcw_broadcast(pub_pkt, (uint16_t)pub_len);
+	if (ar_pub_wrote(&pub, now, ret == 0)) {
+		printk("[Alertam] PUBLIC alert sent (pending %lld s): \"%s\" - re-broadcasting "
+		       "every %d s for %d s\n", (now - pub.started) / 1000, pub_text,
+		       AR_PUB_REBROADCAST_MS / 1000, AR_PUB_STALE_MS / 1000);
+		led_confirm();
+	} else if (ret == 0) {
+		printk("[Alertam] PUBLIC alert re-broadcast #%u (packet age %lld s)\n",
+		       pub.writes - 1, (now - pub.built) / 1000);
+	} else {
+		printk("[Alertam] PUBLIC alert write failed (%d), retry in %d s\n", ret,
+		       AR_PUB_RETRY_MS / 1000);
+	}
+}
+
+static void private_step(int64_t now, bool ok_to_send, bool new_link)
+{
+	if (!priv.active) {
+		return;
+	}
+	if (ar_priv_tick(&priv, now) > 0) {
+		for (int i = 0; i < priv.n; i++) {
+			if (priv.r[i].state == AR_RCPT_EXPIRED) {
+				printk("[Alertam] private SOS -> %s: NOT delivered after %u attempts, "
+				       "giving up\n", rcpt[i].name, priv.r[i].attempts);
+			}
+		}
+	}
+	if (new_link) {
+		ar_priv_link_up(&priv, now);
+	}
+	for (int i = 0; i < priv.n; i++) {
+		if (!ar_priv_due(&priv, i, now, ok_to_send)) {
+			continue;
+		}
+		/* one failing member must not block the others */
+		int ret = bcw_send_private_with_id(rcpt[i].id_hex, priv_text, rcpt[i].msg_id);
+		ar_priv_attempted(&priv, i, now, ret == 0);
+		printk("[Alertam] private SOS -> %s: attempt %u %s, next in %lld s\n", rcpt[i].name,
+		       priv.r[i].attempts + priv.r[i].failures,
+		       ret == 0 ? "sent/queued" : "failed", (priv.r[i].next - now) / 1000);
+	}
+}
+
+static void retry_handler(struct k_work *work)
+{
+	int64_t now = k_uptime_get();
+	bool new_link = atomic_clear(&link_kick) != 0;
+	bool ok_to_send = can_send();
+
+	k_mutex_lock(&alert_lock, K_FOREVER);
+	public_step(now, ok_to_send, new_link);
+	private_step(now, ok_to_send, new_link);
+	bool active = pub.state != AR_PUB_IDLE || priv.active;
+	k_mutex_unlock(&alert_lock);
+
+	if (active) {
+		k_work_reschedule_for_queue(ble_q, &retry_work, K_MSEC(RETRY_TICK_MS));
+	}
+}
 
 static void public_alert_handler(struct k_work *work)
 {
-	int ret = send_public(sos_text);
-	printk("[Alertam] PUBLIC alert %s: \"%s\"\n",
-	       ret == 0 ? "sent" : "NOT sent (no phone in range)", sos_text);
+	int64_t now = k_uptime_get();
+	k_mutex_lock(&alert_lock, K_FOREVER);
+	bool same = pub.state != AR_PUB_IDLE && strcmp(pub_text, sos_text) == 0;
+	if (pub.state != AR_PUB_IDLE) {
+		printk("[Alertam] PUBLIC alert re-triggered (%s)\n",
+		       same && ar_pub_fresh(&pub, now) ? "same packet, lifetime refreshed"
+						       : "new packet");
+	}
+	ar_pub_start(&pub, now, same);
+	strcpy(pub_text, sos_text);
+	if (!can_send()) {
+		printk("[Alertam] PUBLIC alert pending (%s): \"%s\"\n", why_not(), pub_text);
+	}
+	k_mutex_unlock(&alert_lock);
+	k_work_reschedule_for_queue(ble_q, &retry_work, K_NO_WAIT);
 }
 
-static void private_sos_handler(struct k_work *work)
+/* Is the active SOS for the same text and the same circle? */
+static bool same_sos(void)
 {
-	int n = 0, ok = 0;
+	int n = 0;
+	if (!priv.active || strcmp(priv_text, sos_text) != 0) {
+		return false;
+	}
 	for (int i = 0; i < CIRCLE_MAX; i++) {
 		if (!circle[i].used) {
 			continue;
 		}
+		bool found = false;
+		for (int j = 0; j < priv.n && !found; j++) {
+			found = strcmp(rcpt[j].id_hex, circle[i].id_hex) == 0;
+		}
+		if (!found) {
+			return false;
+		}
 		n++;
-		/* one failing member must not block the others */
-		int ret = bcw_send_private(circle[i].id_hex, sos_text);
-		printk("[Alertam] private SOS -> %s (%s): %s\n", circle[i].name, circle[i].id_hex,
-		       ret == 0 ? "sent/queued" : "failed");
-		ok += ret == 0;
 	}
-	if (n == 0) {
-		printk("[Alertam] private SOS: circle is empty (use 'circle add <nick>')\n");
+	return n == priv.n;
+}
+
+static void private_sos_handler(struct k_work *work)
+{
+	int64_t now = k_uptime_get();
+	k_mutex_lock(&alert_lock, K_FOREVER);
+	if (same_sos()) {
+		ar_priv_restart(&priv, now);
+		printk("[Alertam] private SOS re-triggered: %d undelivered retried now\n",
+		       ar_priv_count(&priv, AR_RCPT_PENDING) + ar_priv_count(&priv, AR_RCPT_SENT));
 	} else {
-		printk("[Alertam] private SOS: %d/%d recipients\n", ok, n);
+		/* New SOS: snapshot the circle and the text, one messageID each */
+		int n = 0;
+		for (int i = 0; i < CIRCLE_MAX; i++) {
+			if (!circle[i].used || bcw_lookup_peer(circle[i].id_hex, rcpt[n].id) != 0) {
+				continue;
+			}
+			snprintk(rcpt[n].name, sizeof(rcpt[n].name), "%s", circle[i].name);
+			snprintk(rcpt[n].id_hex, sizeof(rcpt[n].id_hex), "%s", circle[i].id_hex);
+			bcw_new_message_id(rcpt[n].msg_id);
+			n++;
+		}
+		ar_priv_start(&priv, now, n);
+		strcpy(priv_text, sos_text);
+		if (n == 0) {
+			printk("[Alertam] private SOS: circle is empty (use 'circle add <nick>')\n");
+		} else if (!can_send()) {
+			printk("[Alertam] private SOS to %d recipient(s) pending (%s)\n", n, why_not());
+		} else {
+			printk("[Alertam] private SOS to %d recipient(s)\n", n);
+		}
 	}
+	k_mutex_unlock(&alert_lock);
+	k_work_reschedule_for_queue(ble_q, &retry_work, K_NO_WAIT);
+}
+
+/* Delivered ACK / read receipt from bitchat_wire (BLE work queue) */
+static void on_delivered(const uint8_t peer_id[8], const char *msg_id)
+{
+	int64_t now = k_uptime_get();
+	k_mutex_lock(&alert_lock, K_FOREVER);
+	for (int i = 0; i < priv.n; i++) {
+		if (memcmp(rcpt[i].id, peer_id, 8) != 0 || strcmp(rcpt[i].msg_id, msg_id) != 0) {
+			continue;
+		}
+		if (ar_priv_ack(&priv, i, now)) {
+			printk("[Alertam] private SOS -> %s: delivered (%u attempt(s), %lld s)\n",
+			       rcpt[i].name, priv.r[i].attempts, (now - priv.started) / 1000);
+			if (ar_priv_count(&priv, AR_RCPT_DELIVERED) == priv.n) {
+				printk("[Alertam] private SOS: all %d recipient(s) delivered\n", priv.n);
+			}
+			led_confirm();
+		}
+		break;
+	}
+	k_mutex_unlock(&alert_lock);
+}
+
+void alertam_link_ready(void)
+{
+	if (!ble_q) {
+		return;
+	}
+	atomic_set(&link_kick, 1);
+	k_work_reschedule_for_queue(ble_q, &retry_work, K_NO_WAIT);
 }
 
 static K_WORK_DEFINE(public_alert_work, public_alert_handler);
@@ -74,6 +283,20 @@ static void led_blink(int times, int on_ms, int off_ms)
 			k_msleep(off_ms);
 		}
 	}
+}
+
+/* Short blink when a delivery is first confirmed. Called from the BLE queue,
+ * so it must not sleep: the system work queue turns the LED off. */
+static void led_off_handler(struct k_work *work)
+{
+	gpio_pin_set_dt(&led, 0);
+}
+static K_WORK_DELAYABLE_DEFINE(led_off_work, led_off_handler);
+
+static void led_confirm(void)
+{
+	gpio_pin_set_dt(&led, 1);
+	k_work_reschedule(&led_off_work, K_MSEC(200));
 }
 
 /* ---------- button thread ---------- */
@@ -112,10 +335,11 @@ static void button_thread(void *a, void *b, void *c)
 K_THREAD_STACK_DEFINE(button_stack, 1536);
 static struct k_thread button_tid;
 
-int alertam_init(struct k_work_q *q, alertam_public_fn public_fn)
+int alertam_init(struct k_work_q *q, alertam_links_fn links_fn)
 {
 	ble_q = q;
-	send_public = public_fn;
+	links_ready = links_fn;
+	bcw_set_delivered_cb(on_delivered);
 
 	if (!gpio_is_ready_dt(&btn_ext) || !gpio_is_ready_dt(&btn_boot) || !gpio_is_ready_dt(&led)) {
 		printk("[Alertam] GPIO not ready\n");
@@ -161,6 +385,52 @@ static int cmd_sos_public(const struct shell *sh, size_t argc, char **argv)
 static int cmd_sos_private(const struct shell *sh, size_t argc, char **argv)
 {
 	k_work_submit_to_queue(ble_q, &private_sos_work);
+	return 0;
+}
+
+static int cmd_sos_status(const struct shell *sh, size_t argc, char **argv)
+{
+	int64_t now = k_uptime_get();
+	k_mutex_lock(&alert_lock, K_FOREVER);
+	shell_print(sh, "Links ready: %d, clock %s", links_ready ? links_ready() : 0,
+		    bcw_clock_synced() ? "synced" : "NOT synced");
+	if (pub.state == AR_PUB_IDLE) {
+		shell_print(sh, "PUBLIC: idle");
+	} else {
+		shell_print(sh, "PUBLIC: %s for %lld s, %u write(s), %u packet(s)%s \"%s\"",
+			    ar_pub_state_name(pub.state), (now - pub.started) / 1000, pub.writes,
+			    pub.builds, ar_pub_fresh(&pub, now) ? " (re-broadcasting)" : "", pub_text);
+		if (pub.state == AR_PUB_SENT) {
+			shell_print(sh, "  ends in %lld s",
+				    (pub.first_sent + AR_LIFETIME_MS - now) / 1000);
+		}
+	}
+	if (priv.n == 0) {
+		shell_print(sh, "PRIVATE: none");
+	} else {
+		shell_print(sh, "PRIVATE: %s, started %lld s ago, %d/%d delivered \"%s\"",
+			    priv.active ? "active" : "done", (now - priv.started) / 1000,
+			    ar_priv_count(&priv, AR_RCPT_DELIVERED), priv.n, priv_text);
+		for (int i = 0; i < priv.n; i++) {
+			const struct ar_rcpt *r = &priv.r[i];
+			bool waiting = r->state == AR_RCPT_PENDING || r->state == AR_RCPT_SENT;
+			shell_print(sh, "  %-12s %s  %s, %u attempt(s), %u failure(s)%s%lld%s",
+				    rcpt[i].name, rcpt[i].id_hex, ar_rcpt_state_name(r->state),
+				    r->attempts, r->failures, waiting ? ", next in " : "",
+				    waiting ? MAX(0, r->next - now) / 1000 : 0LL, waiting ? " s" : "");
+		}
+	}
+	k_mutex_unlock(&alert_lock);
+	return 0;
+}
+
+static int cmd_sos_cancel(const struct shell *sh, size_t argc, char **argv)
+{
+	k_mutex_lock(&alert_lock, K_FOREVER);
+	ar_pub_stop(&pub);
+	ar_priv_stop(&priv);
+	k_mutex_unlock(&alert_lock);
+	printk("[Alertam] alerts cancelled from the shell\n");
 	return 0;
 }
 
@@ -242,6 +512,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_sos,
 	SHELL_CMD(text, NULL, "[text] - Show/set the alert text", cmd_sos_text),
 	SHELL_CMD(public, NULL, "Fire the public alert (same as long press)", cmd_sos_public),
 	SHELL_CMD(private, NULL, "Fire the private SOS (same as double tap)", cmd_sos_private),
+	SHELL_CMD(status, NULL, "Active alerts and per-recipient delivery state", cmd_sos_status),
+	SHELL_CMD(cancel, NULL, "Stop retrying all active alerts", cmd_sos_cancel),
 	SHELL_SUBCMD_SET_END
 );
 SHELL_CMD_REGISTER(sos, &sub_sos, "Alertam alerts", NULL);
